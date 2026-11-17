@@ -15,14 +15,17 @@ pasta_dados = os.environ.get("DADOS_DIR", "/dados")
 os.makedirs(pasta_dados, exist_ok=True)
 arquivo = os.path.join(pasta_dados, nome + ".json")
 
-relogio = 0         # relógio lógico
-deslocamento = 0.0  # ajuste do relógio físico (vem do serviço de referência)
+relogio = 0                                              # relógio lógico
+deslocamento = float(os.environ.get("CLOCK_OFFSET", 0))  # ajuste do relógio físico (para testar a sincronização)
 rank = 0
 mensagens_recebidas = 0
+coordenador = None       # nome do servidor eleito como coordenador
+precisa_eleicao = False  # fica True quando outro servidor pede uma eleição
+diferencas = {}          # (só do coordenador) diferença de relógio de cada servidor
 
 
 def agora():
-    # hora física já com o ajuste da referência
+    # hora física já com o ajuste
     return time.time() + deslocamento
 
 
@@ -137,61 +140,204 @@ def pedir_referencia(servico, conteudo):
     return resposta
 
 
+def perguntar(servidor, servico, conteudo):
+    # envia uma requisição para outro servidor (com tempo limite).
+    # Devolve None se o servidor não responder.
+    s = context.socket(zmq.REQ)
+    s.setsockopt(zmq.LINGER, 0)
+    s.setsockopt(zmq.RCVTIMEO, 2000)
+    s.setsockopt(zmq.SNDTIMEO, 2000)
+    conteudo = preparar(conteudo)
+    print(f"[{nome}] ENVIADO   | {servidor['name']}/{servico} | {conteudo}", flush=True)
+    try:
+        s.connect("tcp://" + servidor["name"] + ":" + str(6000 + servidor["rank"]))
+        s.send(msgpack.packb({"service": servico, "data": conteudo}))
+        resposta = msgpack.unpackb(s.recv())["data"]
+        receber_clock(resposta)
+        print(f"[{nome}] RECEBIDO  | {servidor['name']}/{servico} | {resposta}", flush=True)
+        return resposta
+    except zmq.ZMQError:
+        print(f"[{nome}] SEM RESPOSTA | {servidor['name']}/{servico}", flush=True)
+        return None
+    finally:
+        s.close()
+
+
 def heartbeat():
+    # só avisa a referência que o servidor continua funcionando
+    pedir_referencia("heartbeat", {"user": nome})
+
+
+def eleicao():
+    # algoritmo do valentão: pede eleição aos servidores com rank maior.
+    # Se nenhum responder, este servidor vira o coordenador.
+    global coordenador
+    print(f"[{nome}] ELEICAO   | iniciada", flush=True)
+    lista = pedir_referencia("list", {"user": nome})["list"]
+
+    alguem_respondeu = False
+    for servidor in lista:
+        if servidor["rank"] > rank:
+            resposta = perguntar(servidor, "election", {"user": nome})
+            if resposta is not None and resposta["status"] == "OK":
+                alguem_respondeu = True
+
+    if alguem_respondeu:
+        # um servidor maior vai assumir e avisar no tópico "servers"
+        coordenador = None
+        return
+
+    coordenador = nome
+    diferencas.clear()
+    conteudo = preparar({"coordinator": nome})
+    pub.send_multipart([b"servers", msgpack.packb({"service": "servers", "data": conteudo})])
+    print(f"[{nome}] ELEITO    | {nome} é o novo coordenador", flush=True)
+
+
+def tratar_relogio(msg):
+    # algoritmo de Berkeley (feito pelo coordenador): calcula a média das
+    # diferenças dos relógios, ajusta o próprio relógio e devolve a hora correta
     global deslocamento
-    t0 = time.time()
-    resposta = pedir_referencia("heartbeat", {"user": nome})
-    t1 = time.time()
+    servidor = msg["user"]
+    diferencas[servidor] = msg["time"] - agora()
+    media = sum(diferencas.values()) / (len(diferencas) + 1)
 
-    # atualiza o relógio: hora da referência + metade do tempo de ida e volta
-    if resposta["status"] == "OK":
-        hora_certa = resposta["time"] + (t1 - t0) / 2
-        deslocamento = hora_certa - t1
-        print(f"[{nome}] RELOGIO   | ajuste de {deslocamento:.6f}s", flush=True)
+    deslocamento += media
+    for s in diferencas:
+        diferencas[s] -= media
+    diferencas[servidor] = 0
+    return {"status": "OK", "time": agora()}
 
-    lista = pedir_referencia("list", {"user": nome})
-    print(f"[{nome}] SERVIDORES | {lista['list']}", flush=True)
+
+def sincronizar_relogio():
+    # pede a hora correta ao coordenador (se ele não responder, faz eleição)
+    global deslocamento, coordenador
+    if coordenador is None:
+        eleicao()
+    if coordenador is None or coordenador == nome:
+        return
+
+    lista = pedir_referencia("list", {"user": nome})["list"]
+    servidor = None
+    for s in lista:
+        if s["name"] == coordenador:
+            servidor = s
+
+    resposta = None
+    if servidor is not None:
+        t0 = time.time()
+        resposta = perguntar(servidor, "clock", {"user": nome, "time": agora()})
+        t1 = time.time()
+
+    if resposta is None or resposta["status"] != "OK":
+        print(f"[{nome}] coordenador {coordenador} indisponível", flush=True)
+        coordenador = None
+        eleicao()
+        return
+
+    # hora do coordenador + metade do tempo de ida e volta
+    hora_certa = resposta["time"] + (t1 - t0) / 2
+    deslocamento += hora_certa - agora()
+    print(f"[{nome}] RELOGIO   | sincronizado com {coordenador} (ajuste total: {deslocamento:.3f}s)", flush=True)
+
+
+def tratar_servidor(msg):
+    # requisições vindas de outros servidores
+    global precisa_eleicao
+    servico = msg["service"]
+    receber_clock(msg["data"])
+    print(f"[{nome}] RECEBIDO  | {servico} | {msg['data']}", flush=True)
+
+    if servico == "election":
+        precisa_eleicao = True  # depois de responder, este servidor também faz eleição
+        resposta = {"status": "OK"}
+    elif servico == "clock" and coordenador == nome:
+        resposta = tratar_relogio(msg["data"])
+    else:
+        resposta = {"status": "erro", "description": "serviço desconhecido"}
+
+    preparar(resposta)
+    print(f"[{nome}] ENVIADO   | {servico} | {resposta}", flush=True)
+    return {"service": servico, "data": resposta}
 
 
 context = zmq.Context()
-socket = context.socket(zmq.REP)
-socket.connect("tcp://" + broker + ":5556")
+rep = context.socket(zmq.REP)
+rep.connect("tcp://" + broker + ":5556")
+
+# socket para receber requisições dos outros servidores (porta 6000 + rank)
+peer = context.socket(zmq.REP)
 
 pub = context.socket(zmq.PUB)
 pub.connect("tcp://" + proxy + ":5557")
-time.sleep(1)  # tempo para a conexão com o proxy ficar pronta
+
+sub = context.socket(zmq.SUB)
+sub.connect("tcp://" + proxy + ":5558")
+sub.setsockopt(zmq.SUBSCRIBE, b"servers")
+time.sleep(1)  # tempo para as conexões com o proxy ficarem prontas
 
 ref = context.socket(zmq.REQ)
 ref.connect("tcp://" + referencia + ":5559")
 
 # pede o rank para o serviço de referência
 rank = pedir_referencia("rank", {"user": nome})["rank"]
+peer.bind("tcp://*:" + str(6000 + rank))
 print(f"[{nome}] servidor iniciado com rank {rank}", flush=True)
 
+eleicao()
+
+poller = zmq.Poller()
+poller.register(rep, zmq.POLLIN)
+poller.register(peer, zmq.POLLIN)
+poller.register(sub, zmq.POLLIN)
+
 while True:
-    pacote = socket.recv()
-    msg = msgpack.unpackb(pacote)
-    servico = msg["service"]
-    conteudo = msg["data"]
-    receber_clock(conteudo)
-    print(f"[{nome}] RECEBIDO  | {servico} | {conteudo}", flush=True)
+    eventos = dict(poller.poll())
 
-    if servico == "login":
-        resposta = tratar_login(conteudo)
-    elif servico == "channel":
-        resposta = tratar_criar_canal(conteudo)
-    elif servico == "channels":
-        resposta = tratar_listar_canais(conteudo)
-    elif servico == "publish":
-        resposta = tratar_publicar(conteudo)
-    else:
-        resposta = {"status": "erro", "description": "serviço desconhecido"}
+    # requisições dos outros servidores (eleição e relógio)
+    if peer in eventos:
+        msg = msgpack.unpackb(peer.recv())
+        peer.send(msgpack.packb(tratar_servidor(msg)))
 
-    preparar(resposta)
-    print(f"[{nome}] ENVIADO   | {servico} | {resposta}", flush=True)
-    socket.send(msgpack.packb({"service": servico, "data": resposta}))
+    # avisos de novo coordenador
+    if sub in eventos:
+        topico, conteudo = sub.recv_multipart()
+        msg = msgpack.unpackb(conteudo)
+        receber_clock(msg["data"])
+        coordenador = msg["data"]["coordinator"]
+        print(f"[{nome}] COORDENADOR | {coordenador}", flush=True)
 
-    # a cada 10 mensagens de clientes manda o heartbeat para a referência
-    mensagens_recebidas += 1
-    if mensagens_recebidas % 10 == 0:
-        heartbeat()
+    # requisições dos clientes
+    if rep in eventos:
+        msg = msgpack.unpackb(rep.recv())
+        servico = msg["service"]
+        conteudo = msg["data"]
+        receber_clock(conteudo)
+        print(f"[{nome}] RECEBIDO  | {servico} | {conteudo}", flush=True)
+
+        if servico == "login":
+            resposta = tratar_login(conteudo)
+        elif servico == "channel":
+            resposta = tratar_criar_canal(conteudo)
+        elif servico == "channels":
+            resposta = tratar_listar_canais(conteudo)
+        elif servico == "publish":
+            resposta = tratar_publicar(conteudo)
+        else:
+            resposta = {"status": "erro", "description": "serviço desconhecido"}
+
+        preparar(resposta)
+        print(f"[{nome}] ENVIADO   | {servico} | {resposta}", flush=True)
+        rep.send(msgpack.packb({"service": servico, "data": resposta}))
+
+        mensagens_recebidas += 1
+        # a cada 10 mensagens de clientes manda o heartbeat para a referência
+        if mensagens_recebidas % 10 == 0:
+            heartbeat()
+        # a cada 15 mensagens sincroniza o relógio com o coordenador
+        if mensagens_recebidas % 15 == 0:
+            sincronizar_relogio()
+
+    if precisa_eleicao:
+        precisa_eleicao = False
+        eleicao()
