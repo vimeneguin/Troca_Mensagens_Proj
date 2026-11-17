@@ -9,10 +9,36 @@ import msgpack
 nome = os.environ.get("SERVER_NAME", "servidor_1")
 broker = os.environ.get("BROKER_HOST", "broker")
 proxy = os.environ.get("PROXY_HOST", "proxy")
+referencia = os.environ.get("REFERENCE_HOST", "referencia")
 pasta_dados = os.environ.get("DADOS_DIR", "/dados")
 
 os.makedirs(pasta_dados, exist_ok=True)
 arquivo = os.path.join(pasta_dados, nome + ".json")
+
+relogio = 0         # relógio lógico
+deslocamento = 0.0  # ajuste do relógio físico (vem do serviço de referência)
+rank = 0
+mensagens_recebidas = 0
+
+
+def agora():
+    # hora física já com o ajuste da referência
+    return time.time() + deslocamento
+
+
+def receber_clock(conteudo):
+    # relógio lógico: ao receber, fica com o maior valor
+    global relogio
+    relogio = max(relogio, conteudo.get("clock", 0))
+
+
+def preparar(conteudo):
+    # relógio lógico: incrementa antes de enviar e coloca na mensagem
+    global relogio
+    relogio += 1
+    conteudo["timestamp"] = agora()
+    conteudo["clock"] = relogio
+    return conteudo
 
 
 def carregar():
@@ -75,23 +101,17 @@ def tratar_publicar(msg):
     canal = msg.get("channel", "")
     texto = msg.get("message", "")
 
-    if canal not in dados["canais"]:
-        return {"status": "erro", "description": "canal não existe neste servidor"}
+    # os servidores ainda não replicam os canais entre si, então não dá para
+    # exigir que o canal esteja na lista deste servidor (ele pode ter sido criado em outro)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", canal):
+        return {"status": "erro", "description": "nome de canal inválido"}
     if texto == "":
         return {"status": "erro", "description": "mensagem vazia"}
 
     # publica no canal usando o nome do canal como tópico
-    publicacao = {
-        "service": "publish",
-        "data": {
-            "user": usuario,
-            "channel": canal,
-            "message": texto,
-            "timestamp": time.time(),
-        },
-    }
-    pub.send_multipart([canal.encode(), msgpack.packb(publicacao)])
-    print(f"[{nome}] PUBLICADO | {canal} | {publicacao['data']}", flush=True)
+    conteudo = preparar({"user": usuario, "channel": canal, "message": texto})
+    pub.send_multipart([canal.encode(), msgpack.packb({"service": "publish", "data": conteudo})])
+    print(f"[{nome}] PUBLICADO | {canal} | {conteudo}", flush=True)
 
     # guarda a publicação em disco
     dados["mensagens"].append({
@@ -99,10 +119,38 @@ def tratar_publicar(msg):
         "channel": canal,
         "message": texto,
         "timestamp_requisicao": msg["timestamp"],
-        "timestamp_publicacao": publicacao["data"]["timestamp"],
+        "timestamp_publicacao": conteudo["timestamp"],
+        "clock": conteudo["clock"],
     })
     salvar()
     return {"status": "sucesso"}
+
+
+def pedir_referencia(servico, conteudo):
+    # envia uma requisição para o serviço de referência e devolve a resposta
+    conteudo = preparar(conteudo)
+    print(f"[{nome}] ENVIADO   | referencia/{servico} | {conteudo}", flush=True)
+    ref.send(msgpack.packb({"service": servico, "data": conteudo}))
+    resposta = msgpack.unpackb(ref.recv())["data"]
+    receber_clock(resposta)
+    print(f"[{nome}] RECEBIDO  | referencia/{servico} | {resposta}", flush=True)
+    return resposta
+
+
+def heartbeat():
+    global deslocamento
+    t0 = time.time()
+    resposta = pedir_referencia("heartbeat", {"user": nome})
+    t1 = time.time()
+
+    # atualiza o relógio: hora da referência + metade do tempo de ida e volta
+    if resposta["status"] == "OK":
+        hora_certa = resposta["time"] + (t1 - t0) / 2
+        deslocamento = hora_certa - t1
+        print(f"[{nome}] RELOGIO   | ajuste de {deslocamento:.6f}s", flush=True)
+
+    lista = pedir_referencia("list", {"user": nome})
+    print(f"[{nome}] SERVIDORES | {lista['list']}", flush=True)
 
 
 context = zmq.Context()
@@ -113,13 +161,19 @@ pub = context.socket(zmq.PUB)
 pub.connect("tcp://" + proxy + ":5557")
 time.sleep(1)  # tempo para a conexão com o proxy ficar pronta
 
-print(f"[{nome}] servidor iniciado", flush=True)
+ref = context.socket(zmq.REQ)
+ref.connect("tcp://" + referencia + ":5559")
+
+# pede o rank para o serviço de referência
+rank = pedir_referencia("rank", {"user": nome})["rank"]
+print(f"[{nome}] servidor iniciado com rank {rank}", flush=True)
 
 while True:
     pacote = socket.recv()
     msg = msgpack.unpackb(pacote)
     servico = msg["service"]
     conteudo = msg["data"]
+    receber_clock(conteudo)
     print(f"[{nome}] RECEBIDO  | {servico} | {conteudo}", flush=True)
 
     if servico == "login":
@@ -133,6 +187,11 @@ while True:
     else:
         resposta = {"status": "erro", "description": "serviço desconhecido"}
 
-    resposta["timestamp"] = time.time()
+    preparar(resposta)
     print(f"[{nome}] ENVIADO   | {servico} | {resposta}", flush=True)
     socket.send(msgpack.packb({"service": servico, "data": resposta}))
+
+    # a cada 10 mensagens de clientes manda o heartbeat para a referência
+    mensagens_recebidas += 1
+    if mensagens_recebidas % 10 == 0:
+        heartbeat()
